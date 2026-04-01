@@ -1,4 +1,5 @@
 import argparse
+import csv
 import json
 from datetime import datetime
 from pathlib import Path
@@ -8,7 +9,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn.functional as F
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
+from skimage import measure
 
 from radseg.radseg import RADSegEncoder
 
@@ -47,6 +49,17 @@ def parse_args():
         "--show",
         action="store_true",
         help="Display results with matplotlib after saving them.",
+    )
+    parser.add_argument(
+        "--show-labels",
+        action="store_true",
+        help="Generate labeled mask outputs and region tables in segmentation mode.",
+    )
+    parser.add_argument(
+        "--label-min-area",
+        type=int,
+        default=500,
+        help="Minimum connected-region area in pixels required to draw a label.",
     )
     parser.add_argument(
         "--timings",
@@ -159,6 +172,141 @@ def save_metadata(output_dir: Path, metadata: dict):
     (output_dir / "metadata.json").write_text(json.dumps(metadata, indent=2))
 
 
+def get_label_font(image_shape: tuple[int, int, int]) -> ImageFont.ImageFont:
+    size = max(10, min(image_shape[0], image_shape[1]) // 35)
+    try:
+        return ImageFont.truetype("DejaVuSans.ttf", size=size)
+    except OSError:
+        return ImageFont.load_default()
+
+
+def get_center_location(mask: np.ndarray) -> tuple[int, int]:
+    loc = np.argwhere(mask == 1)
+    if loc.size == 0:
+        return (0, 0)
+
+    loc_sort = np.array(sorted(loc.tolist(), key=lambda row: (row[0], row[1])))
+    y_list = loc_sort[:, 0]
+    unique, counts = np.unique(y_list, return_counts=True)
+    y_loc = unique[counts.argmax()]
+    y_most_freq_loc = loc[loc_sort[:, 0] == y_loc]
+    center_num = len(y_most_freq_loc) // 2
+    x = int(y_most_freq_loc[center_num][1])
+    y = int(y_most_freq_loc[center_num][0])
+    return (x, y)
+
+
+def extract_labeled_regions(
+    seg_pred_np: np.ndarray,
+    class_index_to_name: dict[int, str],
+    palette: np.ndarray,
+    min_area: int,
+) -> list[dict]:
+    regions = []
+    region_id = 1
+
+    for class_index in sorted(np.unique(seg_pred_np).tolist()):
+        if class_index == 0:
+            continue
+
+        class_mask = (seg_pred_np == class_index).astype(np.uint8)
+        labeled_mask = measure.label(class_mask, connectivity=2)
+        num_regions = int(labeled_mask.max())
+
+        for region_label in range(1, num_regions + 1):
+            region_mask = labeled_mask == region_label
+            pixel_area = int(region_mask.sum())
+            if pixel_area < min_area:
+                continue
+
+            ys, xs = np.nonzero(region_mask)
+            center_x, center_y = get_center_location(region_mask.astype(np.uint8))
+            color_rgb = [int(channel) for channel in palette[class_index].tolist()]
+
+            regions.append(
+                {
+                    "region_id": region_id,
+                    "class_index": int(class_index),
+                    "class_name": class_index_to_name[int(class_index)],
+                    "pixel_area": pixel_area,
+                    "bbox_xmin": int(xs.min()),
+                    "bbox_ymin": int(ys.min()),
+                    "bbox_xmax": int(xs.max()),
+                    "bbox_ymax": int(ys.max()),
+                    "center_x": int(center_x),
+                    "center_y": int(center_y),
+                    "color_rgb": color_rgb,
+                }
+            )
+            region_id += 1
+
+    return regions
+
+
+def draw_labeled_regions(image_rgb: np.ndarray, regions: list[dict]) -> np.ndarray:
+    labeled_image = Image.fromarray(image_rgb.copy())
+    draw = ImageDraw.Draw(labeled_image)
+    font = get_label_font(image_rgb.shape)
+
+    for region in regions:
+        text = region["class_name"]
+        center_x = region["center_x"]
+        center_y = region["center_y"]
+        color = tuple(region["color_rgb"])
+
+        bbox = draw.textbbox((0, 0), text, font=font, stroke_width=1)
+        text_width = bbox[2] - bbox[0]
+        text_height = bbox[3] - bbox[1]
+        padding_x = 6
+        padding_y = 4
+        box_width = text_width + 2 * padding_x
+        box_height = text_height + 2 * padding_y
+
+        x0 = max(0, min(image_rgb.shape[1] - box_width, center_x - box_width // 2))
+        y0 = max(0, min(image_rgb.shape[0] - box_height, center_y - box_height // 2))
+        x1 = x0 + box_width
+        y1 = y0 + box_height
+
+        draw.rectangle((x0, y0, x1, y1), fill=color, outline=(0, 0, 0), width=1)
+        draw.text(
+            (x0 + padding_x, y0 + padding_y),
+            text,
+            fill=(255, 255, 255),
+            font=font,
+            stroke_width=1,
+            stroke_fill=(0, 0, 0),
+        )
+
+    return np.array(labeled_image)
+
+
+def save_regions_csv(output_dir: Path, regions: list[dict]):
+    fieldnames = [
+        "region_id",
+        "class_index",
+        "class_name",
+        "pixel_area",
+        "bbox_xmin",
+        "bbox_ymin",
+        "bbox_xmax",
+        "bbox_ymax",
+        "center_x",
+        "center_y",
+        "color_rgb",
+    ]
+    with (output_dir / "regions.csv").open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for region in regions:
+            row = dict(region)
+            row["color_rgb"] = ",".join(str(channel) for channel in row["color_rgb"])
+            writer.writerow(row)
+
+
+def save_regions_json(output_dir: Path, regions: list[dict]):
+    (output_dir / "regions.json").write_text(json.dumps(regions, indent=2))
+
+
 def sync_cuda():
     if torch.cuda.is_available():
         torch.cuda.synchronize()
@@ -269,34 +417,83 @@ def run_mask_mode(args, classes: list[str], device: str, output_dir: Path):
         palette = build_palette(len(classes) + 1)
         color_mask = palette[seg_pred_np]
         overlay = blend_overlay(image_np, color_mask)
-        return seg_probs_np, seg_pred_np, color_mask, overlay
+        class_index_to_name = {0: "__background__"} | {
+            i + 1: class_name for i, class_name in enumerate(classes)
+        }
 
-    seg_probs_np, seg_pred_np, color_mask, overlay = measure_stage(
+        labeled_regions = []
+        mask_color_labeled = None
+        overlay_labeled = None
+        if args.show_labels:
+            labeled_regions = extract_labeled_regions(
+                seg_pred_np,
+                class_index_to_name,
+                palette,
+                min_area=args.label_min_area,
+            )
+            mask_color_labeled = draw_labeled_regions(color_mask, labeled_regions)
+            overlay_labeled = draw_labeled_regions(overlay, labeled_regions)
+
+        return (
+            seg_probs_np,
+            seg_pred_np,
+            color_mask,
+            overlay,
+            class_index_to_name,
+            labeled_regions,
+            mask_color_labeled,
+            overlay_labeled,
+        )
+
+    (
+        seg_probs_np,
+        seg_pred_np,
+        color_mask,
+        overlay,
+        class_index_to_name,
+        labeled_regions,
+        mask_color_labeled,
+        overlay_labeled,
+    ) = measure_stage(
         "postprocess_mask", timings, postprocess_mask
     )
+
+    outputs = [
+        "input.png",
+        "mask_index.png",
+        "mask_color.png",
+        "overlay.png",
+        "seg_probs.npy",
+    ]
+    if args.show_labels:
+        outputs.extend(
+            [
+                "mask_color_labeled.png",
+                "overlay_labeled.png",
+                "regions.csv",
+                "regions.json",
+            ]
+        )
 
     metadata = {
         "mode": "mask",
         "image": str(Path(args.image)),
         "classes": classes,
-        "class_indices": {"0": "__background__"} | {str(i + 1): cls for i, cls in enumerate(classes)},
+        "class_indices": {str(index): name for index, name in class_index_to_name.items()},
         "model_version": args.model_version,
         "lang_model": args.lang_model,
         "device": device,
         "sam_refinement": args.sam_refinement,
         "sam_ckpt": args.sam_ckpt if args.sam_refinement else None,
+        "show_labels": args.show_labels,
+        "label_min_area": args.label_min_area if args.show_labels else None,
+        "num_labeled_regions": len(labeled_regions),
         "prediction_thresh": args.prediction_thresh,
         "slide_crop": args.slide_crop,
         "slide_stride": args.slide_stride,
         "scra_scaling": args.scra_scaling,
         "scga_scaling": args.scga_scaling,
-        "outputs": [
-            "input.png",
-            "mask_index.png",
-            "mask_color.png",
-            "overlay.png",
-            "seg_probs.npy",
-        ],
+        "outputs": outputs,
     }
     if timings is not None:
         metadata["timings_seconds"] = dict(timings)
@@ -306,6 +503,11 @@ def run_mask_mode(args, classes: list[str], device: str, output_dir: Path):
         Image.fromarray(seg_pred_np, mode="L").save(output_dir / "mask_index.png")
         Image.fromarray(color_mask).save(output_dir / "mask_color.png")
         Image.fromarray(overlay).save(output_dir / "overlay.png")
+        if args.show_labels:
+            Image.fromarray(mask_color_labeled).save(output_dir / "mask_color_labeled.png")
+            Image.fromarray(overlay_labeled).save(output_dir / "overlay_labeled.png")
+            save_regions_csv(output_dir, labeled_regions)
+            save_regions_json(output_dir, labeled_regions)
         np.save(output_dir / "seg_probs.npy", seg_probs_np)
         if timings is not None:
             metadata["timings_fps"] = {
@@ -328,13 +530,25 @@ def run_mask_mode(args, classes: list[str], device: str, output_dir: Path):
         print_timing_summary(timings)
 
     if args.show:
-        fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-        axes[0].imshow(image_np)
-        axes[0].set_title("Input")
-        axes[1].imshow(color_mask)
-        axes[1].set_title("Segmentation")
-        axes[2].imshow(overlay)
-        axes[2].set_title("Overlay")
+        panels = [
+            ("Input", image_np),
+            ("Segmentation", color_mask),
+            ("Overlay", overlay),
+        ]
+        if args.show_labels:
+            panels.extend(
+                [
+                    ("Segmentation Labeled", mask_color_labeled),
+                    ("Overlay Labeled", overlay_labeled),
+                ]
+            )
+
+        fig, axes = plt.subplots(1, len(panels), figsize=(5 * len(panels), 5))
+        axes = np.atleast_1d(axes)
+        for ax, (title, image) in zip(axes, panels):
+            ax.imshow(image)
+            ax.set_title(title)
+            ax.axis("off")
         for ax in axes:
             ax.axis("off")
         plt.tight_layout()
@@ -492,6 +706,10 @@ def main():
     image_path = Path(args.image)
     if not image_path.is_file():
         raise FileNotFoundError(f"Image not found: {args.image}")
+    if args.show_labels and args.heatmaps:
+        raise ValueError("--show-labels is only supported in final segmentation mode, not with --heatmaps.")
+    if args.label_min_area < 0:
+        raise ValueError("--label-min-area must be zero or a positive integer.")
 
     classes = parse_classes(args.classes)
     device = resolve_device(args.device)

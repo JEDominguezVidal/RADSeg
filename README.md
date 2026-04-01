@@ -155,6 +155,8 @@ python radseg_minimal_demo.py \
 
 This mode saves a final segmentation mask, a colorized mask, an overlay, the raw probability tensor, and metadata to a timestamped directory such as `outputs/minimal_demo/execution_yyyy_mm_dd_hh_mm_ss/`.
 
+If you want validation-oriented outputs with class names written on the detected regions, add `--show-labels`. That keeps the standard `mask_color.png` and `overlay.png` unchanged and adds `mask_color_labeled.png`, `overlay_labeled.png`, `regions.csv`, and `regions.json`.
+
 To generate per-class heatmaps instead of the final segmentation outputs, add `--heatmaps`:
 
 ```bash
@@ -170,7 +172,20 @@ Useful options:
 - `--output-dir outputs/my_run` to choose the base directory where timestamped execution folders are created.
 - `--timings` to print per-stage timings and store them in `metadata.json` for cross-machine comparisons.
 - `--show` to display the saved results with `matplotlib`.
+- `--show-labels` to generate additional labeled segmentation outputs and per-region tables in final segmentation mode.
+- `--label-min-area 500` to suppress labels for tiny connected regions that are likely visual noise.
 - `--sam-refinement --sam-ckpt sam_vit_h_4b8939.pth` to enable SAM refinement in final segmentation mode.
+
+Example with labeled segmentation outputs:
+
+```bash
+python radseg_minimal_demo.py \
+  --image assets/example1.jpg \
+  --classes sky,road,car \
+  --show-labels
+```
+
+`--show-labels` is only available in the default segmentation mode and cannot be combined with `--heatmaps`.
 
 The first run will still download the RADIO weights if they are not already cached locally.
 
