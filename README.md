@@ -32,19 +32,45 @@
 
 ## Environment Setup
 
-Create a conda environment and install base dependencies:
+RADSeg is currently set up around Python 3.11, PyTorch 2.4.0, torchvision 0.19.0 and CUDA 12.1. The commands below assume you are running from the repository root unless a section explicitly changes directory.
+
+### Option 1: Conda
+Create the original conda environment and install the base dependencies:
 ```bash
 conda env create -f environment.yml
 conda activate radseg
 ```
 
+### Option 2: Virtual Environment (`venv`)
+If you prefer a standard virtual environment instead of conda, first make sure Python 3.11 and the `venv` module are installed on your system. Then create and activate the environment:
+
+```bash
+python3.11 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip setuptools wheel
+python -m pip install -r requirements.txt
+```
+
+`requirements.txt` mirrors the base dependencies from `environment.yml` and targets the same CUDA 12.1 wheel index used by the conda setup. If you need a CPU-only install or a different CUDA version, adjust the first lines of `requirements.txt` to use the matching PyTorch wheel index from the [official PyTorch installation matrix](https://docs.pytorch.org/get-started/previous-versions/).
+
+Quick verification:
+```bash
+python -c "import torch; print(torch.__version__); print(torch.cuda.is_available())"
+```
+
+Important notes for either setup path:
+- The project is not packaged as an installable wheel, so run the commands below from the repository root unless the README tells you to `cd` elsewhere.
+- The first time you load RADSeg, `torch.hub` will download the RADIO backbone and adaptor weights from `NVlabs/RADIO`, so internet access is required on first use.
+- SAM refinement is optional, but if you enable `sam_refinement` or `--sam_refine`, you must separately download the `sam_vit_h_4b8939.pth` checkpoint from the [official Segment Anything release](https://github.com/facebookresearch/segment-anything?tab=readme-ov-file#model-checkpoints). The default config assumes a local file with that name, so either place it in your working directory or update the `sam_ckpt` path in your config/code.
+
 Additional dependencies for 2D evaluation:
-1. Install OpenMMLab dependencies:
+1. Activate the conda environment or the virtual environment created above, then install the OpenMMLab dependencies inside that same environment:
    ```bash
-   pip install mmengine==0.10.1
-   pip install mmcv==2.2.0 -f https://download.openmmlab.com/mmcv/dist/cu121/torch2.4/index.html
-   pip install mmsegmentation==1.2.2
+   python -m pip install mmengine==0.10.1
+   python -m pip install mmcv==2.2.0 -f https://download.openmmlab.com/mmcv/dist/cu121/torch2.4/index.html
+   python -m pip install mmsegmentation==1.2.2
    ```
+   These packages are intentionally not included in `requirements.txt`, because `mmcv` must match the exact PyTorch/CUDA combination you installed.
 
 2. **MMSegmentation Compatibility:** 
    In `{site-packages-path}/mmseg/__init__.py`, you may need to update the `mmcv` version check (Approved by original mmcv author). Change:
@@ -57,7 +83,12 @@ Additional dependencies for 2D evaluation:
    ```
 
 Additional dependencies for 3D evaluation:
-Please follow the minimal setup instructions of [RayFronts Environment Setup](https://github.com/RayFronts/RayFronts?tab=readme-ov-file#environment-setup) to set up the conda/mamba environment for 3D evaluations.
+Initialize the RayFronts submodule first:
+```bash
+git submodule update --init --recursive
+```
+
+Then follow the minimal setup instructions of [RayFronts Environment Setup](https://github.com/RayFronts/RayFronts?tab=readme-ov-file#environment-setup). The base `requirements.txt` in this repository covers RADSeg itself, but not the full RayFronts 3D evaluation stack.
 
 ## Quickstart
 
@@ -83,7 +114,7 @@ with torch.inference_mode():
          classes=labels)
 
     # Prepare image
-    img = Image.open('sheep2.jpg').convert('RGB')
+    img = Image.open('assets/example1.jpg').convert('RGB')
     img_tensor = T.ToTensor()(img).unsqueeze(0).to('cuda')
 
     seg_probs = model.encode_image_to_feat_map(img_tensor) # [1, len(labels)+1, H, W]
@@ -95,19 +126,52 @@ with torch.inference_mode():
     plt.show()
 ```
 
+The first call to `torch.hub.load(...)` will download the RADIO weights and adaptors if they are not already cached locally.
+
 ### Gradio Demo
 To test RADSeg on your own images using an interactive Gradio interface (Available online [here](https://huggingface.co/spaces/theairlabcmu/RADSeg)):
 
-1. **Activate Environment**:
+1. **Activate the environment you created in the setup section**:
    ```bash
    conda activate radseg
+   # or
+   source .venv/bin/activate
    ```
 
-2. **Run the App**:
+2. **Run the app from the repository root**:
    ```bash
    python radseg_demo.py
    ```
 This will launch an interface where you can upload images, add custom text prompts, and adjust model parameters
+
+### Minimal CLI Demo
+For headless usage without Gradio, use the minimal command-line demo:
+
+```bash
+python radseg_minimal_demo.py \
+  --image assets/example1.jpg \
+  --classes sky,road,car
+```
+
+This mode saves a final segmentation mask, a colorized mask, an overlay, the raw probability tensor, and metadata to `outputs/minimal_demo/` by default.
+
+To generate per-class heatmaps instead of the final segmentation outputs, add `--heatmaps`:
+
+```bash
+python radseg_minimal_demo.py \
+  --image assets/example1.jpg \
+  --classes sky,road,car \
+  --heatmaps
+```
+
+Useful options:
+- `--model-version c-radio_v3-b` or another RADIO variant supported by the upstream model hub.
+- `--lang-model siglip2` to choose the language adaptor.
+- `--output-dir outputs/my_run` to choose where results are saved.
+- `--show` to display the saved results with `matplotlib`.
+- `--sam-refinement --sam-ckpt sam_vit_h_4b8939.pth` to enable SAM refinement in final segmentation mode.
+
+The first run will still download the RADIO weights if they are not already cached locally.
 
 ## 2D Evaluation
 
@@ -115,11 +179,12 @@ This will launch an interface where you can upload images, add custom text promp
 Please follow the [MMSegmentation data preparation](https://github.com/open-mmlab/mmsegmentation/blob/main/docs/en/user_guides/2_dataset_prepare.md) to download and process the 5 2D datasets.
 
 ### Running Evaluation 
-To evaluate RADSeg on a specific 2D dataset, switch to the evaluation/2d directory and run:
+To evaluate RADSeg on a specific 2D dataset, activate your environment, switch to the `evaluation/2d` directory and run:
 
 ```bash
+cd evaluation/2d
 python eval.py \
-  --config configs_mmseg/YOUR_CONFIG.py \
+  --config configs/mid_res_configs/cfg_voc20.py \
   --model_version c-radio_v3-b \
   --lang_model siglip2 \
   --scra_scaling 10.0 \
@@ -136,15 +201,19 @@ Arguments:
 - `--scga_scaling`: Scaling factor for Self-Correlating Global Aggregation (SCGA).
 - `--sam_refine`: Enable RADIO-SAM mask refinement for RADSeg+ performance (include flag to enable).
 
+If you enable `--sam_refine`, make sure the `sam_ckpt` path in your config points to a valid `sam_vit_h_4b8939.pth` checkpoint file.
 
 To run evaluation across multiple resolutions and configs as defined in `eval_all.py`:
 
 ```bash
+cd evaluation/2d
 python eval_all.py
 ```
 This script iterates over defined configurations (Low Resolution, Mid Resolution and High Resolution) and runs the evaluation automatically.
 
 ## 3D Evaluation
+
+Before running 3D evaluation commands, make sure the RayFronts submodule has been initialized with `git submodule update --init --recursive`.
 
 ### Dataset Preparation
 Please follow the guidelines and dataset download links provided by [RayFronts Datasets](https://github.com/RayFronts/RayFronts/tree/main/rayfronts/datasets#datasets--data-sourcesstreams) to process and prepare the 3 datasets (Replica - NiceReplica version, ScanNet, ScanNet++) used for 3D evaluation.
