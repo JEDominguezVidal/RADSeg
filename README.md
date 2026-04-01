@@ -168,10 +168,37 @@ Useful options:
 - `--model-version c-radio_v3-b` or another RADIO variant supported by the upstream model hub.
 - `--lang-model siglip2` to choose the language adaptor.
 - `--output-dir outputs/my_run` to choose the base directory where timestamped execution folders are created.
+- `--timings` to print per-stage timings and store them in `metadata.json` for cross-machine comparisons.
 - `--show` to display the saved results with `matplotlib`.
 - `--sam-refinement --sam-ckpt sam_vit_h_4b8939.pth` to enable SAM refinement in final segmentation mode.
 
 The first run will still download the RADIO weights if they are not already cached locally.
+
+If you want to benchmark end-to-end performance, use `--timings`. The script records per-stage timings and a `total_execution` summary; that total is the most useful number for comparing full execution time across different PCs.
+
+### Interpretation Of Timings
+
+When `--timings` is enabled, the demo prints and stores the duration of each stage. The meaning of each number is:
+
+| Stage | Mode | What it measures | How to interpret it |
+| --- | --- | --- | --- |
+| `load_image` | Both | Open image, convert to RGB, build tensor, move it to CPU/GPU, normalize to `[0, 1]` | Usually small. Large values suggest slow storage or host-to-device transfer. |
+| `create_encoder` | Both | Build `RADSegEncoder`, load RADIO/adaptors, move the model to the selected device | Often large on the first run. In `segmentation`, this also includes text-embedding setup for the requested classes. |
+| `model_inference` | Segmentation | Run the main end-to-end prediction path and produce segmentation logits/predictions | This is the core image inference time for mask mode. |
+| `postprocess_mask` | Segmentation | Convert tensors to NumPy, build color mask and overlay in memory | CPU-side processing after inference. Usually much smaller than model loading. |
+| `compute_feature_map` | Heatmaps | Extract spatial visual features from the image | Roughly the vision backbone part of heatmap mode. |
+| `align_features` | Heatmaps | Project visual features into the language-aligned space | Usually small compared with backbone inference. |
+| `encode_labels` | Heatmaps | Encode the class names into text embeddings using RADIO prompt templates | Can be very large when many classes are used. RADSeg uses multiple prompt templates per class, so this cost grows with the number of labels. |
+| `compute_similarity` | Heatmaps | Compare text embeddings with image features and upsample the result | Usually small relative to model loading and text encoding. |
+| `postprocess_heatmaps` | Heatmaps | Build heatmaps and overlays in memory for every class | Grows with the number of classes because one heatmap/overlay pair is prepared per label. |
+| `save_outputs` | Both | Write images, NumPy arrays, and `metadata.json` to disk | Can be significant, especially in heatmap mode because many more files are written. |
+| `total_execution` | Both | Full measured end-to-end runtime of the execution | This is the best single number to compare overall performance across PCs. |
+
+Notes:
+- Compare timings only when using the same image, the same mode (`segmentation` or `heatmaps`), the same classes, and the same model settings.
+- `segmentation` and `heatmaps` are not directly comparable because they do different work and save different outputs.
+- In `segmentation`, part of the text-processing cost is absorbed into `create_encoder`; in `heatmaps`, it appears explicitly as `encode_labels`.
+- The first run can be slower than later runs if model weights or adaptor files are still being loaded into cache.
 
 ## 2D Evaluation
 

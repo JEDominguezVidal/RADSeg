@@ -2,6 +2,7 @@ import argparse
 import json
 from datetime import datetime
 from pathlib import Path
+from time import perf_counter
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -46,6 +47,11 @@ def parse_args():
         "--show",
         action="store_true",
         help="Display results with matplotlib after saving them.",
+    )
+    parser.add_argument(
+        "--timings",
+        action="store_true",
+        help="Measure and report per-stage execution times.",
     )
     parser.add_argument(
         "--heatmaps",
@@ -153,6 +159,49 @@ def save_metadata(output_dir: Path, metadata: dict):
     (output_dir / "metadata.json").write_text(json.dumps(metadata, indent=2))
 
 
+def sync_cuda():
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
+def fps_from_seconds(elapsed_seconds: float) -> float:
+    if elapsed_seconds <= 0:
+        return float("inf")
+    return 1.0 / elapsed_seconds
+
+
+def measure_stage(stage_name: str, timings: dict | None, fn, *args, **kwargs):
+    if timings is None:
+        return fn(*args, **kwargs)
+    sync_cuda()
+    start = perf_counter()
+    result = fn(*args, **kwargs)
+    sync_cuda()
+    timings[stage_name] = perf_counter() - start
+    return result
+
+
+def format_fps(elapsed_seconds: float) -> str:
+    fps = fps_from_seconds(elapsed_seconds)
+    return "inf" if fps == float("inf") else f"{fps:.2f}"
+
+
+def print_timing_summary(timings: dict):
+    print("\n" + "=" * 60)
+    print("RADSEG TIMING SUMMARY")
+    print("=" * 60)
+    for stage_name, elapsed in timings.items():
+        print(f"{stage_name:<28}: {elapsed:.4f} s ({format_fps(elapsed)} FPS)")
+    print(
+        "\nBenchmark note: 'total_execution' is the most useful number to compare end-to-end throughput between PCs."
+    )
+    total = timings.get("total_execution")
+    if total is not None:
+        print(f"Per-image latency (RADSeg): {total * 1000:.2f} ms")
+        print(f"Equivalent throughput      : {format_fps(total)} FPS")
+    print("=" * 60 + "\n")
+
+
 def create_execution_dir(base_output_dir: Path) -> Path:
     timestamp = datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
     execution_name = f"execution_{timestamp}"
@@ -173,15 +222,24 @@ def create_execution_dir(base_output_dir: Path) -> Path:
 
 @torch.inference_mode()
 def run_mask_mode(args, classes: list[str], device: str, output_dir: Path):
+    timings = {} if args.timings else None
+    sync_cuda()
+    total_start = perf_counter() if args.timings else None
+
     if args.sam_refinement and not Path(args.sam_ckpt).is_file():
         raise FileNotFoundError(
             f"SAM checkpoint not found: {args.sam_ckpt}. Disable --sam-refinement or provide a valid path."
         )
 
-    image_pil, tensor_image = load_image(Path(args.image), device)
+    image_pil, tensor_image = measure_stage(
+        "load_image", timings, load_image, Path(args.image), device
+    )
     image_np = np.array(image_pil)
 
-    encoder = RADSegEncoder(
+    encoder = measure_stage(
+        "create_encoder",
+        timings,
+        RADSegEncoder,
         device=device,
         model_version=args.model_version,
         lang_model=args.lang_model,
@@ -196,24 +254,26 @@ def run_mask_mode(args, classes: list[str], device: str, output_dir: Path):
         sam_ckpt=args.sam_ckpt,
     )
 
-    seg_probs, seg_pred = encoder.encode_image_to_feat_map(
+    seg_probs, seg_pred = measure_stage(
+        "model_inference",
+        timings,
+        encoder.encode_image_to_feat_map,
         tensor_image,
         orig_img_size=image_np.shape[:2],
         return_preds=True,
     )
 
-    seg_probs_np = seg_probs.squeeze(0).detach().cpu().numpy()
-    seg_pred_np = seg_pred.squeeze(0).squeeze(0).detach().cpu().numpy().astype(np.uint8)
+    def postprocess_mask():
+        seg_probs_np = seg_probs.squeeze(0).detach().cpu().numpy()
+        seg_pred_np = seg_pred.squeeze(0).squeeze(0).detach().cpu().numpy().astype(np.uint8)
+        palette = build_palette(len(classes) + 1)
+        color_mask = palette[seg_pred_np]
+        overlay = blend_overlay(image_np, color_mask)
+        return seg_probs_np, seg_pred_np, color_mask, overlay
 
-    palette = build_palette(len(classes) + 1)
-    color_mask = palette[seg_pred_np]
-    overlay = blend_overlay(image_np, color_mask)
-
-    image_pil.save(output_dir / "input.png")
-    Image.fromarray(seg_pred_np, mode="L").save(output_dir / "mask_index.png")
-    Image.fromarray(color_mask).save(output_dir / "mask_color.png")
-    Image.fromarray(overlay).save(output_dir / "overlay.png")
-    np.save(output_dir / "seg_probs.npy", seg_probs_np)
+    seg_probs_np, seg_pred_np, color_mask, overlay = measure_stage(
+        "postprocess_mask", timings, postprocess_mask
+    )
 
     metadata = {
         "mode": "mask",
@@ -238,7 +298,34 @@ def run_mask_mode(args, classes: list[str], device: str, output_dir: Path):
             "seg_probs.npy",
         ],
     }
-    save_metadata(output_dir, metadata)
+    if timings is not None:
+        metadata["timings_seconds"] = dict(timings)
+
+    def save_outputs():
+        image_pil.save(output_dir / "input.png")
+        Image.fromarray(seg_pred_np, mode="L").save(output_dir / "mask_index.png")
+        Image.fromarray(color_mask).save(output_dir / "mask_color.png")
+        Image.fromarray(overlay).save(output_dir / "overlay.png")
+        np.save(output_dir / "seg_probs.npy", seg_probs_np)
+        if timings is not None:
+            metadata["timings_fps"] = {
+                stage_name: fps_from_seconds(elapsed)
+                for stage_name, elapsed in metadata["timings_seconds"].items()
+            }
+        save_metadata(output_dir, metadata)
+
+    measure_stage("save_outputs", timings, save_outputs)
+
+    if timings is not None:
+        sync_cuda()
+        timings["total_execution"] = perf_counter() - total_start
+        metadata["timings_seconds"] = dict(timings)
+        metadata["timings_fps"] = {
+            stage_name: fps_from_seconds(elapsed)
+            for stage_name, elapsed in metadata["timings_seconds"].items()
+        }
+        save_metadata(output_dir, metadata)
+        print_timing_summary(timings)
 
     if args.show:
         fig, axes = plt.subplots(1, 3, figsize=(15, 5))
@@ -256,13 +343,22 @@ def run_mask_mode(args, classes: list[str], device: str, output_dir: Path):
 
 @torch.inference_mode()
 def run_heatmap_mode(args, classes: list[str], device: str, output_dir: Path):
+    timings = {} if args.timings else None
+    sync_cuda()
+    total_start = perf_counter() if args.timings else None
+
     if args.sam_refinement:
         raise ValueError("--sam-refinement is only supported in final segmentation mode, not with --heatmaps.")
 
-    image_pil, tensor_image = load_image(Path(args.image), device)
+    image_pil, tensor_image = measure_stage(
+        "load_image", timings, load_image, Path(args.image), device
+    )
     image_np = np.array(image_pil)
 
-    encoder = RADSegEncoder(
+    encoder = measure_stage(
+        "create_encoder",
+        timings,
+        RADSegEncoder,
         device=device,
         model_version=args.model_version,
         lang_model=args.lang_model,
@@ -273,44 +369,62 @@ def run_heatmap_mode(args, classes: list[str], device: str, output_dir: Path):
         slide_stride=args.slide_stride,
     )
 
-    feat_map = encoder.encode_image_to_feat_map(
+    feat_map = measure_stage(
+        "compute_feature_map",
+        timings,
+        encoder.encode_image_to_feat_map,
         tensor_image,
         orig_img_size=image_np.shape[:2],
     )
-    aligned_feats = encoder.align_spatial_features_with_language(feat_map, onehot=False)
-    prompt_embeds = encoder.encode_labels(classes)
+    aligned_feats = measure_stage(
+        "align_features",
+        timings,
+        encoder.align_spatial_features_with_language,
+        feat_map,
+        onehot=False,
+    )
+    prompt_embeds = measure_stage(
+        "encode_labels", timings, encoder.encode_labels, classes
+    )
 
-    _, channels, height, width = aligned_feats.shape
-    aligned_feats_flat = aligned_feats.permute(0, 2, 3, 1).reshape(-1, channels)
-    vec1 = prompt_embeds / prompt_embeds.norm(dim=-1, keepdim=True)
-    vec2 = aligned_feats_flat / aligned_feats_flat.norm(dim=-1, keepdim=True)
-    sim = vec1 @ vec2.t()
-    sim = sim.reshape(len(classes), height, width)
-    sim = F.interpolate(
-        sim.unsqueeze(0),
-        size=image_np.shape[:2],
-        mode="bilinear",
-        align_corners=False,
-    ).squeeze(0)
+    def compute_similarity():
+        _, channels, height, width = aligned_feats.shape
+        aligned_feats_flat = aligned_feats.permute(0, 2, 3, 1).reshape(-1, channels)
+        vec1 = prompt_embeds / prompt_embeds.norm(dim=-1, keepdim=True)
+        vec2 = aligned_feats_flat / aligned_feats_flat.norm(dim=-1, keepdim=True)
+        sim = vec1 @ vec2.t()
+        sim = sim.reshape(len(classes), height, width)
+        sim = F.interpolate(
+            sim.unsqueeze(0),
+            size=image_np.shape[:2],
+            mode="bilinear",
+            align_corners=False,
+        ).squeeze(0)
+        return sim
 
-    image_pil.save(output_dir / "input.png")
+    sim = measure_stage("compute_similarity", timings, compute_similarity)
 
-    outputs = ["input.png"]
-    for index, class_name in enumerate(classes):
-        heatmap = sim[index].detach().cpu().numpy()
-        heatmap_rgb = apply_heatmap(heatmap)
-        overlay = blend_overlay(image_np, heatmap_rgb)
-        stem = f"{index + 1:02d}_{sanitize_name(class_name)}"
-        Image.fromarray(heatmap_rgb).save(output_dir / f"{stem}_heatmap.png")
-        Image.fromarray(overlay).save(output_dir / f"{stem}_overlay.png")
-        np.save(output_dir / f"{stem}_scores.npy", heatmap)
-        outputs.extend(
-            [
-                f"{stem}_heatmap.png",
-                f"{stem}_overlay.png",
-                f"{stem}_scores.npy",
-            ]
-        )
+    def postprocess_heatmaps():
+        output_items = ["input.png"]
+        processed_items = []
+        for index, class_name in enumerate(classes):
+            heatmap = sim[index].detach().cpu().numpy()
+            heatmap_rgb = apply_heatmap(heatmap)
+            overlay = blend_overlay(image_np, heatmap_rgb)
+            stem = f"{index + 1:02d}_{sanitize_name(class_name)}"
+            output_items.extend(
+                [
+                    f"{stem}_heatmap.png",
+                    f"{stem}_overlay.png",
+                    f"{stem}_scores.npy",
+                ]
+            )
+            processed_items.append((stem, heatmap, heatmap_rgb, overlay))
+        return output_items, processed_items
+
+    outputs, processed_heatmaps = measure_stage(
+        "postprocess_heatmaps", timings, postprocess_heatmaps
+    )
 
     metadata = {
         "mode": "heatmaps",
@@ -325,7 +439,34 @@ def run_heatmap_mode(args, classes: list[str], device: str, output_dir: Path):
         "scga_scaling": args.scga_scaling,
         "outputs": outputs,
     }
-    save_metadata(output_dir, metadata)
+    if timings is not None:
+        metadata["timings_seconds"] = dict(timings)
+
+    def save_outputs():
+        image_pil.save(output_dir / "input.png")
+        for stem, heatmap, heatmap_rgb, overlay in processed_heatmaps:
+            Image.fromarray(heatmap_rgb).save(output_dir / f"{stem}_heatmap.png")
+            Image.fromarray(overlay).save(output_dir / f"{stem}_overlay.png")
+            np.save(output_dir / f"{stem}_scores.npy", heatmap)
+        if timings is not None:
+            metadata["timings_fps"] = {
+                stage_name: fps_from_seconds(elapsed)
+                for stage_name, elapsed in metadata["timings_seconds"].items()
+            }
+        save_metadata(output_dir, metadata)
+
+    measure_stage("save_outputs", timings, save_outputs)
+
+    if timings is not None:
+        sync_cuda()
+        timings["total_execution"] = perf_counter() - total_start
+        metadata["timings_seconds"] = dict(timings)
+        metadata["timings_fps"] = {
+            stage_name: fps_from_seconds(elapsed)
+            for stage_name, elapsed in metadata["timings_seconds"].items()
+        }
+        save_metadata(output_dir, metadata)
+        print_timing_summary(timings)
 
     if args.show:
         cols = 2
