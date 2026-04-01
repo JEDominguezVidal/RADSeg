@@ -153,7 +153,7 @@ python radseg_minimal_demo.py \
   --classes sky,road,car
 ```
 
-This mode saves a final segmentation mask, a colorized mask, an overlay, the raw probability tensor, and metadata to `outputs/minimal_demo/` by default.
+This mode saves a final segmentation mask, a colorized mask, an overlay, the raw probability tensor, and metadata to a timestamped directory such as `outputs/minimal_demo/execution_yyyy_mm_dd_hh_mm_ss/`.
 
 To generate per-class heatmaps instead of the final segmentation outputs, add `--heatmaps`:
 
@@ -167,7 +167,7 @@ python radseg_minimal_demo.py \
 Useful options:
 - `--model-version c-radio_v3-b` or another RADIO variant supported by the upstream model hub.
 - `--lang-model siglip2` to choose the language adaptor.
-- `--output-dir outputs/my_run` to choose where results are saved.
+- `--output-dir outputs/my_run` to choose the base directory where timestamped execution folders are created.
 - `--show` to display the saved results with `matplotlib`.
 - `--sam-refinement --sam-ckpt sam_vit_h_4b8939.pth` to enable SAM refinement in final segmentation mode.
 
