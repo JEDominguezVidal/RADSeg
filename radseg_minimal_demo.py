@@ -14,6 +14,11 @@ from skimage import measure
 
 from radseg.radseg import RADSegEncoder
 
+LABEL_BOX_ALPHA = 0.7
+
+if not 0.0 <= LABEL_BOX_ALPHA <= 1.0:
+    raise ValueError("LABEL_BOX_ALPHA must be within [0.0, 1.0].")
+
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -244,9 +249,12 @@ def extract_labeled_regions(
 
 
 def draw_labeled_regions(image_rgb: np.ndarray, regions: list[dict]) -> np.ndarray:
-    labeled_image = Image.fromarray(image_rgb.copy())
-    draw = ImageDraw.Draw(labeled_image)
+    labeled_image = Image.fromarray(image_rgb.copy()).convert("RGBA")
+    box_layer = Image.new("RGBA", labeled_image.size, (0, 0, 0, 0))
+    box_draw = ImageDraw.Draw(box_layer)
     font = get_label_font(image_rgb.shape)
+    text_items = []
+    box_alpha = int(round(255 * LABEL_BOX_ALPHA))
 
     for region in regions:
         text = region["class_name"]
@@ -254,7 +262,7 @@ def draw_labeled_regions(image_rgb: np.ndarray, regions: list[dict]) -> np.ndarr
         center_y = region["center_y"]
         color = tuple(region["color_rgb"])
 
-        bbox = draw.textbbox((0, 0), text, font=font, stroke_width=1)
+        bbox = box_draw.textbbox((0, 0), text, font=font, stroke_width=1)
         text_width = bbox[2] - bbox[0]
         text_height = bbox[3] - bbox[1]
         padding_x = 6
@@ -267,17 +275,31 @@ def draw_labeled_regions(image_rgb: np.ndarray, regions: list[dict]) -> np.ndarr
         x1 = x0 + box_width
         y1 = y0 + box_height
 
-        draw.rectangle((x0, y0, x1, y1), fill=color, outline=(0, 0, 0), width=1)
-        draw.text(
-            (x0 + padding_x, y0 + padding_y),
-            text,
-            fill=(255, 255, 255),
-            font=font,
-            stroke_width=1,
-            stroke_fill=(0, 0, 0),
+        box_draw.rectangle((x0, y0, x1, y1), fill=(*color, box_alpha))
+        text_items.append(
+            {
+                "rect": (x0, y0, x1, y1),
+                "text_pos": (x0 + padding_x, y0 + padding_y),
+                "text": text,
+            }
         )
 
-    return np.array(labeled_image)
+    labeled_image = Image.alpha_composite(labeled_image, box_layer)
+    draw = ImageDraw.Draw(labeled_image)
+
+    for item in text_items:
+        if box_alpha > 0:
+            draw.rectangle(item["rect"], outline=(0, 0, 0, box_alpha), width=1)
+        draw.text(
+            item["text_pos"],
+            item["text"],
+            fill=(255, 255, 255, box_alpha),
+            font=font,
+            stroke_width=1,
+            stroke_fill=(0, 0, 0, box_alpha),
+        )
+
+    return np.array(labeled_image.convert("RGB"))
 
 
 def save_regions_csv(output_dir: Path, regions: list[dict]):
