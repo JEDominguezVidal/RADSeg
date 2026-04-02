@@ -142,6 +142,26 @@ class RADSegEncoder(ImageSemSegEncoder):
   # TODO: Split into feature encoder and semseg encoder for clarity instead
   # of switching behaviors based on flags.
 
+  def _init_pruned_sam_predictor(self, sam_ckpt: str):
+    """Initialize only the SAM components used by RADSeg refinement.
+
+    RADSeg computes SAM image features externally from RADIO features and only
+    needs the SAM neck, prompt encoder, and mask decoder on the target device.
+    """
+    sam = sam_model_registry["vit_h"](checkpoint=sam_ckpt)
+    sam.eval()
+    sam_predictor = SamPredictor(sam)
+
+    # We inject image features externally, so the heavy ViT encoder body is not
+    # needed once the predictor has been constructed.
+    del sam.image_encoder.blocks
+    del sam.image_encoder.patch_embed
+
+    self.sam = sam.to(device=self.device).eval()
+    self.sam_predictor = sam_predictor
+    if self.device.startswith("cuda"):
+      torch.cuda.empty_cache()
+
   def __init__(self,
                device: str = None,
                model_version: str = "radio_v3-b",
@@ -231,11 +251,7 @@ class RADSegEncoder(ImageSemSegEncoder):
       self.coarse_thresh = coarse_thresh
       self.minimal_area = minimal_area
       self.sam_mask_coff = sam_mask_coff
-      self.sam = sam_model_registry["vit_h"](checkpoint=sam_ckpt).to(device=self.device).eval()
-      self.sam_predictor = SamPredictor(self.sam)
-      del self.sam.image_encoder.blocks
-      del self.sam.image_encoder.patch_embed
-      torch.cuda.empty_cache()
+      self._init_pruned_sam_predictor(sam_ckpt)
 
   @property
   @override
