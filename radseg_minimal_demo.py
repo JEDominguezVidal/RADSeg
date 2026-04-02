@@ -203,6 +203,7 @@ def get_center_location(mask: np.ndarray) -> tuple[int, int]:
 
 def extract_labeled_regions(
     seg_pred_np: np.ndarray,
+    seg_probs_np: np.ndarray,
     class_index_to_name: dict[int, str],
     palette: np.ndarray,
     min_area: int,
@@ -227,12 +228,14 @@ def extract_labeled_regions(
             ys, xs = np.nonzero(region_mask)
             center_x, center_y = get_center_location(region_mask.astype(np.uint8))
             color_rgb = [int(channel) for channel in palette[class_index].tolist()]
+            confidence_score = float(seg_probs_np[class_index][region_mask].mean())
 
             regions.append(
                 {
                     "region_id": region_id,
                     "class_index": int(class_index),
                     "class_name": class_index_to_name[int(class_index)],
+                    "confidence_score": confidence_score,
                     "pixel_area": pixel_area,
                     "bbox_xmin": int(xs.min()),
                     "bbox_ymin": int(ys.min()),
@@ -248,6 +251,10 @@ def extract_labeled_regions(
     return regions
 
 
+def format_region_label(region: dict) -> str:
+    return f"{region['class_name']} ({region['confidence_score']:.2f})"
+
+
 def draw_labeled_regions(image_rgb: np.ndarray, regions: list[dict]) -> np.ndarray:
     labeled_image = Image.fromarray(image_rgb.copy()).convert("RGBA")
     box_layer = Image.new("RGBA", labeled_image.size, (0, 0, 0, 0))
@@ -257,7 +264,7 @@ def draw_labeled_regions(image_rgb: np.ndarray, regions: list[dict]) -> np.ndarr
     box_alpha = int(round(255 * LABEL_BOX_ALPHA))
 
     for region in regions:
-        text = region["class_name"]
+        text = format_region_label(region)
         center_x = region["center_x"]
         center_y = region["center_y"]
         color = tuple(region["color_rgb"])
@@ -307,6 +314,7 @@ def save_regions_csv(output_dir: Path, regions: list[dict]):
         "region_id",
         "class_index",
         "class_name",
+        "confidence_score",
         "pixel_area",
         "bbox_xmin",
         "bbox_ymin",
@@ -449,6 +457,7 @@ def run_mask_mode(args, classes: list[str], device: str, output_dir: Path):
         if args.show_labels:
             labeled_regions = extract_labeled_regions(
                 seg_pred_np,
+                seg_probs_np,
                 class_index_to_name,
                 palette,
                 min_area=args.label_min_area,
