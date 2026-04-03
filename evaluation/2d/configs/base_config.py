@@ -6,8 +6,8 @@ model = dict(
     prompt_denoising_thresh=0.5,
     slide_crop=336,
     slide_stride=224,
-    amp=False,
-    compile=False,
+    amp=True,
+    compile=True,
     sam_ckpt = 'sam_vit_h_4b8939.pth'
 )
 

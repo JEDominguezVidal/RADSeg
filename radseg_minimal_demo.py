@@ -46,6 +46,18 @@ def parse_args():
         help="Device to use. Defaults to cuda if available, otherwise cpu.",
     )
     parser.add_argument(
+        "--amp",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable automatic mixed precision during supported CUDA stages.",
+    )
+    parser.add_argument(
+        "--compile",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable torch.compile for the RADIO model and language adaptor.",
+    )
+    parser.add_argument(
         "--output-dir",
         default="outputs/minimal_demo",
         help="Directory where outputs will be written.",
@@ -421,6 +433,8 @@ def run_mask_mode(args, classes: list[str], device: str, output_dir: Path):
         device=device,
         model_version=args.model_version,
         lang_model=args.lang_model,
+        compile=args.compile,
+        amp=args.amp,
         predict=True,
         classes=classes,
         prediction_thresh=args.prediction_thresh,
@@ -514,6 +528,8 @@ def run_mask_mode(args, classes: list[str], device: str, output_dir: Path):
         "model_version": args.model_version,
         "lang_model": args.lang_model,
         "device": device,
+        "amp": args.amp,
+        "compile": args.compile,
         "sam_refinement": args.sam_refinement,
         "sam_ckpt": args.sam_ckpt if args.sam_refinement else None,
         "show_labels": args.show_labels,
@@ -607,6 +623,8 @@ def run_heatmap_mode(args, classes: list[str], device: str, output_dir: Path):
         device=device,
         model_version=args.model_version,
         lang_model=args.lang_model,
+        compile=args.compile,
+        amp=args.amp,
         predict=False,
         scra_scaling=args.scra_scaling,
         scga_scaling=args.scga_scaling,
@@ -678,6 +696,8 @@ def run_heatmap_mode(args, classes: list[str], device: str, output_dir: Path):
         "model_version": args.model_version,
         "lang_model": args.lang_model,
         "device": device,
+        "amp": args.amp,
+        "compile": args.compile,
         "slide_crop": args.slide_crop,
         "slide_stride": args.slide_stride,
         "scra_scaling": args.scra_scaling,
