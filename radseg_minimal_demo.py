@@ -12,6 +12,14 @@ import torch.nn.functional as F
 from PIL import Image, ImageDraw, ImageFont
 from skimage import measure
 
+from radseg.instance_fusion import (
+    build_radio_prompt_specs,
+    rasterize_instance_index,
+    score_instance_candidates,
+    select_instances_with_nms,
+    serialize_instances,
+)
+from radseg.instance_sam2 import SAM2DependencyError, SAM2InstanceHelper
 from radseg.radseg import RADSegEncoder
 
 LABEL_BOX_ALPHA = 0.7
@@ -97,6 +105,68 @@ def parse_args():
         "--sam-ckpt",
         default="sam_vit_h_4b8939.pth",
         help="Path to the SAM checkpoint used when --sam-refinement is enabled.",
+    )
+    parser.add_argument(
+        "--instance-segmentation",
+        action="store_true",
+        help="Generate instance outputs using RADIO semantic cues plus SAM2 candidates.",
+    )
+    parser.add_argument(
+        "--sam2-config",
+        default="configs/sam2.1/sam2.1_hiera_s.yaml",
+        help="SAM2 config name/path used when --instance-segmentation is enabled.",
+    )
+    parser.add_argument(
+        "--sam2-ckpt",
+        default="checkpoints/sam2.1_hiera_small.pt",
+        help="Path to the SAM2 checkpoint used when --instance-segmentation is enabled.",
+    )
+    parser.add_argument(
+        "--instance-candidate-mode",
+        choices=["radio-prompts", "hybrid"],
+        default="radio-prompts",
+        help="Candidate generator used for instance segmentation.",
+    )
+    parser.add_argument(
+        "--instance-seed-thresh",
+        type=float,
+        default=0.5,
+        help="Minimum class probability used to build RADIO seed components.",
+    )
+    parser.add_argument(
+        "--instance-max-seeds-per-component",
+        type=int,
+        default=3,
+        help="Maximum RADIO seeds sampled inside each connected component.",
+    )
+    parser.add_argument(
+        "--instance-min-area",
+        type=int,
+        default=50,
+        help="Minimum candidate/instance area in pixels kept in instance mode.",
+    )
+    parser.add_argument(
+        "--instance-nms-iou",
+        type=float,
+        default=0.75,
+        help="Mask IoU threshold used by per-class instance NMS.",
+    )
+    parser.add_argument(
+        "--sam2-amg-points-per-side",
+        type=int,
+        default=16,
+        help="SAM2 AMG grid density used in hybrid instance mode.",
+    )
+    parser.add_argument(
+        "--sam2-amg-crop-n-layers",
+        type=int,
+        default=0,
+        help="SAM2 AMG crop layers used in hybrid instance mode.",
+    )
+    parser.add_argument(
+        "--instance-save-candidate-overlay",
+        action="store_true",
+        help="Save candidate_overlay.png for debugging in instance mode.",
     )
     parser.add_argument(
         "--prediction-thresh",
@@ -349,6 +419,55 @@ def save_regions_json(output_dir: Path, regions: list[dict]):
     (output_dir / "regions.json").write_text(json.dumps(regions, indent=2))
 
 
+def save_instances_json(output_dir: Path, instances: list[dict]):
+    (output_dir / "instances.json").write_text(json.dumps(instances, indent=2))
+
+
+def colorize_index_map(index_map: np.ndarray) -> np.ndarray:
+    num_colors = int(index_map.max()) + 1
+    palette = build_palette(max(num_colors, 1))
+    if palette.shape[0] > 0:
+        palette[0] = np.array([0, 0, 0], dtype=np.uint8)
+    return palette[index_map]
+
+
+def save_uint16_png(path: Path, image: np.ndarray):
+    Image.fromarray(image.astype(np.uint16), mode="I;16").save(path)
+
+
+def semantic_output_names(show_labels: bool) -> list[str]:
+    outputs = [
+        "input.png",
+        "mask_index.png",
+        "mask_color.png",
+        "overlay.png",
+        "seg_probs.npy",
+    ]
+    if show_labels:
+        outputs.extend(
+            [
+                "mask_color_labeled.png",
+                "overlay_labeled.png",
+                "regions.csv",
+                "regions.json",
+            ]
+        )
+    return outputs
+
+
+def save_semantic_outputs(output_dir: Path, semantic_data: dict, show_labels: bool):
+    semantic_data["image_pil"].save(output_dir / "input.png")
+    Image.fromarray(semantic_data["seg_pred_np"], mode="L").save(output_dir / "mask_index.png")
+    Image.fromarray(semantic_data["color_mask"]).save(output_dir / "mask_color.png")
+    Image.fromarray(semantic_data["overlay"]).save(output_dir / "overlay.png")
+    if show_labels:
+        Image.fromarray(semantic_data["mask_color_labeled"]).save(output_dir / "mask_color_labeled.png")
+        Image.fromarray(semantic_data["overlay_labeled"]).save(output_dir / "overlay_labeled.png")
+        save_regions_csv(output_dir, semantic_data["labeled_regions"])
+        save_regions_json(output_dir, semantic_data["labeled_regions"])
+    np.save(output_dir / "seg_probs.npy", semantic_data["seg_probs_np"])
+
+
 def sync_cuda():
     if torch.cuda.is_available():
         torch.cuda.synchronize()
@@ -410,12 +529,12 @@ def create_execution_dir(base_output_dir: Path) -> Path:
     )
 
 
-@torch.inference_mode()
-def run_mask_mode(args, classes: list[str], device: str, output_dir: Path):
-    timings = {} if args.timings else None
-    sync_cuda()
-    total_start = perf_counter() if args.timings else None
-
+def compute_semantic_segmentation(
+    args,
+    classes: list[str],
+    device: str,
+    timings: dict | None,
+) -> dict:
     if args.sam_refinement and not Path(args.sam_ckpt).is_file():
         raise FileNotFoundError(
             f"SAM checkpoint not found: {args.sam_ckpt}. Disable --sam-refinement or provide a valid path."
@@ -503,28 +622,37 @@ def run_mask_mode(args, classes: list[str], device: str, output_dir: Path):
         "postprocess_mask", timings, postprocess_mask
     )
 
-    outputs = [
-        "input.png",
-        "mask_index.png",
-        "mask_color.png",
-        "overlay.png",
-        "seg_probs.npy",
-    ]
-    if args.show_labels:
-        outputs.extend(
-            [
-                "mask_color_labeled.png",
-                "overlay_labeled.png",
-                "regions.csv",
-                "regions.json",
-            ]
-        )
+    return {
+        "image_pil": image_pil,
+        "image_np": image_np,
+        "seg_probs_np": seg_probs_np,
+        "seg_pred_np": seg_pred_np,
+        "color_mask": color_mask,
+        "overlay": overlay,
+        "class_index_to_name": class_index_to_name,
+        "labeled_regions": labeled_regions,
+        "mask_color_labeled": mask_color_labeled,
+        "overlay_labeled": overlay_labeled,
+    }
+
+
+@torch.inference_mode()
+def run_mask_mode(args, classes: list[str], device: str, output_dir: Path):
+    timings = {} if args.timings else None
+    sync_cuda()
+    total_start = perf_counter() if args.timings else None
+
+    semantic_data = compute_semantic_segmentation(args, classes, device, timings)
+    outputs = semantic_output_names(args.show_labels)
 
     metadata = {
         "mode": "mask",
         "image": str(Path(args.image)),
         "classes": classes,
-        "class_indices": {str(index): name for index, name in class_index_to_name.items()},
+        "class_indices": {
+            str(index): name
+            for index, name in semantic_data["class_index_to_name"].items()
+        },
         "model_version": args.model_version,
         "lang_model": args.lang_model,
         "device": device,
@@ -534,7 +662,7 @@ def run_mask_mode(args, classes: list[str], device: str, output_dir: Path):
         "sam_ckpt": args.sam_ckpt if args.sam_refinement else None,
         "show_labels": args.show_labels,
         "label_min_area": args.label_min_area if args.show_labels else None,
-        "num_labeled_regions": len(labeled_regions),
+        "num_labeled_regions": len(semantic_data["labeled_regions"]),
         "prediction_thresh": args.prediction_thresh,
         "slide_crop": args.slide_crop,
         "slide_stride": args.slide_stride,
@@ -546,16 +674,7 @@ def run_mask_mode(args, classes: list[str], device: str, output_dir: Path):
         metadata["timings_seconds"] = dict(timings)
 
     def save_outputs():
-        image_pil.save(output_dir / "input.png")
-        Image.fromarray(seg_pred_np, mode="L").save(output_dir / "mask_index.png")
-        Image.fromarray(color_mask).save(output_dir / "mask_color.png")
-        Image.fromarray(overlay).save(output_dir / "overlay.png")
-        if args.show_labels:
-            Image.fromarray(mask_color_labeled).save(output_dir / "mask_color_labeled.png")
-            Image.fromarray(overlay_labeled).save(output_dir / "overlay_labeled.png")
-            save_regions_csv(output_dir, labeled_regions)
-            save_regions_json(output_dir, labeled_regions)
-        np.save(output_dir / "seg_probs.npy", seg_probs_np)
+        save_semantic_outputs(output_dir, semantic_data, args.show_labels)
         if timings is not None:
             metadata["timings_fps"] = {
                 stage_name: fps_from_seconds(elapsed)
@@ -578,17 +697,214 @@ def run_mask_mode(args, classes: list[str], device: str, output_dir: Path):
 
     if args.show:
         panels = [
-            ("Input", image_np),
-            ("Segmentation", color_mask),
-            ("Overlay", overlay),
+            ("Input", semantic_data["image_np"]),
+            ("Segmentation", semantic_data["color_mask"]),
+            ("Overlay", semantic_data["overlay"]),
         ]
         if args.show_labels:
             panels.extend(
                 [
-                    ("Segmentation Labeled", mask_color_labeled),
-                    ("Overlay Labeled", overlay_labeled),
+                    ("Segmentation Labeled", semantic_data["mask_color_labeled"]),
+                    ("Overlay Labeled", semantic_data["overlay_labeled"]),
                 ]
             )
+
+        fig, axes = plt.subplots(1, len(panels), figsize=(5 * len(panels), 5))
+        axes = np.atleast_1d(axes)
+        for ax, (title, image) in zip(axes, panels):
+            ax.imshow(image)
+            ax.set_title(title)
+            ax.axis("off")
+        for ax in axes:
+            ax.axis("off")
+        plt.tight_layout()
+        plt.show()
+
+
+@torch.inference_mode()
+def run_instance_mode(args, classes: list[str], device: str, output_dir: Path):
+    timings = {} if args.timings else None
+    sync_cuda()
+    total_start = perf_counter() if args.timings else None
+
+    if args.sam_refinement:
+        raise ValueError(
+            "--sam-refinement is not supported together with --instance-segmentation."
+        )
+
+    semantic_data = compute_semantic_segmentation(args, classes, device, timings)
+
+    def build_sam2_helper():
+        return SAM2InstanceHelper(
+            sam2_config=args.sam2_config,
+            sam2_ckpt=args.sam2_ckpt,
+            device=device,
+            build_amg=args.instance_candidate_mode == "hybrid",
+            amg_points_per_side=args.sam2_amg_points_per_side,
+            amg_crop_n_layers=args.sam2_amg_crop_n_layers,
+            amg_min_mask_region_area=args.instance_min_area,
+        )
+
+    sam2_helper = measure_stage("create_sam2_helper", timings, build_sam2_helper)
+    measure_stage("sam2_set_image", timings, sam2_helper.set_image, semantic_data["image_np"])
+
+    prompt_specs = measure_stage(
+        "build_instance_prompts",
+        timings,
+        build_radio_prompt_specs,
+        semantic_data["seg_probs_np"],
+        semantic_data["seg_pred_np"],
+        semantic_data["class_index_to_name"],
+        sam2_helper.mask_input_size,
+        args.instance_seed_thresh,
+        args.instance_max_seeds_per_component,
+        args.instance_min_area,
+    )
+
+    prompt_candidates = measure_stage(
+        "sam2_prompt_candidates",
+        timings,
+        sam2_helper.generate_from_prompts,
+        prompt_specs,
+        True,
+    )
+
+    amg_candidates = []
+    if args.instance_candidate_mode == "hybrid":
+        amg_candidates = measure_stage(
+            "sam2_amg_candidates",
+            timings,
+            sam2_helper.generate_amg_candidates,
+        )
+
+    def postprocess_instances():
+        raw_candidates = [*prompt_candidates, *amg_candidates]
+        scored_candidates = score_instance_candidates(
+            raw_candidates,
+            semantic_data["seg_probs_np"],
+            semantic_data["class_index_to_name"],
+            min_area=args.instance_min_area,
+        )
+        scored_candidates.sort(key=lambda candidate: candidate.score, reverse=True)
+        selected_candidates = select_instances_with_nms(
+            scored_candidates,
+            nms_iou_thresh=args.instance_nms_iou,
+        )
+
+        image_shape = semantic_data["image_np"].shape[:2]
+        instance_index = rasterize_instance_index(selected_candidates, image_shape)
+        instance_color = colorize_index_map(instance_index)
+        instance_overlay = blend_overlay(semantic_data["image_np"], instance_color)
+
+        candidate_overlay = None
+        if args.instance_save_candidate_overlay:
+            candidate_index = rasterize_instance_index(scored_candidates, image_shape)
+            candidate_color = colorize_index_map(candidate_index)
+            candidate_overlay = blend_overlay(semantic_data["image_np"], candidate_color)
+
+        instances_json = serialize_instances(selected_candidates)
+        return scored_candidates, selected_candidates, instance_index, instance_overlay, candidate_overlay, instances_json
+
+    (
+        scored_candidates,
+        selected_candidates,
+        instance_index,
+        instance_overlay,
+        candidate_overlay,
+        instances_json,
+    ) = measure_stage("postprocess_instances", timings, postprocess_instances)
+
+    outputs = semantic_output_names(args.show_labels)
+    outputs.extend(["instance_index.png", "instance_overlay.png", "instances.json"])
+    if args.instance_save_candidate_overlay:
+        outputs.append("candidate_overlay.png")
+
+    metadata = {
+        "mode": "instance_segmentation",
+        "image": str(Path(args.image)),
+        "classes": classes,
+        "class_indices": {
+            str(index): name
+            for index, name in semantic_data["class_index_to_name"].items()
+        },
+        "model_version": args.model_version,
+        "lang_model": args.lang_model,
+        "device": device,
+        "amp": args.amp,
+        "compile": args.compile,
+        "show_labels": args.show_labels,
+        "label_min_area": args.label_min_area if args.show_labels else None,
+        "prediction_thresh": args.prediction_thresh,
+        "slide_crop": args.slide_crop,
+        "slide_stride": args.slide_stride,
+        "scra_scaling": args.scra_scaling,
+        "scga_scaling": args.scga_scaling,
+        "sam2_config": args.sam2_config,
+        "sam2_ckpt": args.sam2_ckpt,
+        "instance_candidate_mode": args.instance_candidate_mode,
+        "instance_seed_thresh": args.instance_seed_thresh,
+        "instance_max_seeds_per_component": args.instance_max_seeds_per_component,
+        "instance_min_area": args.instance_min_area,
+        "instance_nms_iou": args.instance_nms_iou,
+        "sam2_amg_points_per_side": (
+            args.sam2_amg_points_per_side
+            if args.instance_candidate_mode == "hybrid"
+            else None
+        ),
+        "sam2_amg_crop_n_layers": (
+            args.sam2_amg_crop_n_layers
+            if args.instance_candidate_mode == "hybrid"
+            else None
+        ),
+        "instance_save_candidate_overlay": args.instance_save_candidate_overlay,
+        "num_labeled_regions": len(semantic_data["labeled_regions"]),
+        "num_prompt_specs": len(prompt_specs),
+        "num_prompt_candidates": len(prompt_candidates),
+        "num_amg_candidates": len(amg_candidates),
+        "num_scored_candidates": len(scored_candidates),
+        "num_instances": len(selected_candidates),
+        "outputs": outputs,
+    }
+    if timings is not None:
+        metadata["timings_seconds"] = dict(timings)
+
+    def save_outputs():
+        save_semantic_outputs(output_dir, semantic_data, args.show_labels)
+        save_uint16_png(output_dir / "instance_index.png", instance_index)
+        Image.fromarray(instance_overlay).save(output_dir / "instance_overlay.png")
+        save_instances_json(output_dir, instances_json)
+        if args.instance_save_candidate_overlay and candidate_overlay is not None:
+            Image.fromarray(candidate_overlay).save(output_dir / "candidate_overlay.png")
+        if timings is not None:
+            metadata["timings_fps"] = {
+                stage_name: fps_from_seconds(elapsed)
+                for stage_name, elapsed in metadata["timings_seconds"].items()
+            }
+        save_metadata(output_dir, metadata)
+
+    measure_stage("save_outputs", timings, save_outputs)
+
+    if timings is not None:
+        sync_cuda()
+        timings["total_execution"] = perf_counter() - total_start
+        metadata["timings_seconds"] = dict(timings)
+        metadata["timings_fps"] = {
+            stage_name: fps_from_seconds(elapsed)
+            for stage_name, elapsed in metadata["timings_seconds"].items()
+        }
+        save_metadata(output_dir, metadata)
+        print_timing_summary(timings)
+
+    if args.show:
+        panels = [
+            ("Input", semantic_data["image_np"]),
+            ("Semantic Overlay", semantic_data["overlay"]),
+            ("Instance Overlay", instance_overlay),
+        ]
+        if args.instance_save_candidate_overlay and candidate_overlay is not None:
+            panels.append(("Candidate Overlay", candidate_overlay))
+        if args.show_labels:
+            panels.append(("Semantic Labeled", semantic_data["overlay_labeled"]))
 
         fig, axes = plt.subplots(1, len(panels), figsize=(5 * len(panels), 5))
         axes = np.atleast_1d(axes)
@@ -757,10 +1073,22 @@ def main():
     image_path = Path(args.image)
     if not image_path.is_file():
         raise FileNotFoundError(f"Image not found: {args.image}")
+    if args.instance_segmentation and args.heatmaps:
+        raise ValueError("--instance-segmentation cannot be combined with --heatmaps.")
     if args.show_labels and args.heatmaps:
         raise ValueError("--show-labels is only supported in final segmentation mode, not with --heatmaps.")
     if args.label_min_area < 0:
         raise ValueError("--label-min-area must be zero or a positive integer.")
+    if args.instance_max_seeds_per_component <= 0:
+        raise ValueError("--instance-max-seeds-per-component must be greater than zero.")
+    if args.instance_min_area < 0:
+        raise ValueError("--instance-min-area must be zero or a positive integer.")
+    if not 0.0 <= args.instance_nms_iou <= 1.0:
+        raise ValueError("--instance-nms-iou must be within [0.0, 1.0].")
+    if args.sam2_amg_points_per_side <= 0:
+        raise ValueError("--sam2-amg-points-per-side must be greater than zero.")
+    if args.sam2_amg_crop_n_layers < 0:
+        raise ValueError("--sam2-amg-crop-n-layers must be zero or a positive integer.")
 
     classes = parse_classes(args.classes)
     device = resolve_device(args.device)
@@ -768,10 +1096,15 @@ def main():
     base_output_dir = Path(args.output_dir)
     output_dir = create_execution_dir(base_output_dir)
 
-    if args.heatmaps:
-        run_heatmap_mode(args, classes, device, output_dir)
-    else:
-        run_mask_mode(args, classes, device, output_dir)
+    try:
+        if args.heatmaps:
+            run_heatmap_mode(args, classes, device, output_dir)
+        elif args.instance_segmentation:
+            run_instance_mode(args, classes, device, output_dir)
+        else:
+            run_mask_mode(args, classes, device, output_dir)
+    except SAM2DependencyError as exc:
+        raise RuntimeError(str(exc)) from exc
 
     print(f"Saved outputs to {output_dir}")
 

@@ -166,6 +166,31 @@ python radseg_minimal_demo.py \
   --heatmaps
 ```
 
+To generate instance outputs on top of the semantic map, enable `--instance-segmentation`. This keeps the standard semantic outputs (`mask_color.png`, `overlay.png`, `seg_probs.npy`) and adds `instance_index.png`, `instance_overlay.png`, and `instances.json`.
+
+```bash
+python radseg_minimal_demo.py \
+  --image assets/example1.jpg \
+  --classes sky,road,car \
+  --instance-segmentation \
+  --sam2-ckpt checkpoints/sam2.1_hiera_small.pt
+```
+
+`--instance-segmentation` uses RADIO as the semantic backbone and SAM2 as an optional candidate generator. The default mode is `radio-prompts`, which derives SAM2 prompts from the semantic probability maps. If you want extra proposals from SAM2 automatic mask generation, use `--instance-candidate-mode hybrid`.
+
+The SAM2 integration is optional and requires the official SAM2 package plus its Hydra/OmegaConf dependencies to be installed in the environment. The regular semantic and heatmap modes do not depend on SAM2.
+
+If you already have a local checkout of `Grounded-SAM-2` or the official `sam2` repository on disk, install SAM2 into the same RADSeg environment before using `--instance-segmentation`:
+
+```bash
+source .venv/bin/activate
+python -m pip install -e /path/to/Grounded-SAM-2
+```
+
+If you are working offline and `pip` tries to download build dependencies, retry with `--no-build-isolation` and make sure the following Python packages are already available in the environment: `hydra-core`, `omegaconf`, `iopath`, `portalocker`, and `antlr4-python3-runtime`.
+
+Copying only the SAM2 checkpoints and `.yaml` files is not enough. RADSeg also needs the official `sam2` Python package code so that `sam2.build_sam`, `sam2.sam2_image_predictor`, and `sam2.automatic_mask_generator` can be imported at runtime.
+
 Useful options:
 - `--model-version c-radio_v3-b` or another RADIO variant supported by the upstream model hub.
 - `--lang-model siglip2` to choose the language adaptor.
@@ -175,6 +200,9 @@ Useful options:
 - `--show-labels` to generate additional labeled segmentation outputs and per-region tables in final segmentation mode.
 - `--label-min-area 500` to suppress labels for tiny connected regions that are likely visual noise.
 - `--sam-refinement --sam-ckpt sam_vit_h_4b8939.pth` to enable SAM refinement in final segmentation mode.
+- `--instance-segmentation --sam2-ckpt ...` to enable the new RADIO + SAM2 instance pipeline.
+- `--instance-candidate-mode hybrid` to combine RADIO-guided prompts with SAM2 automatic mask proposals.
+- `--instance-save-candidate-overlay` to save `candidate_overlay.png` for debugging instance proposals.
 
 Example with labeled segmentation outputs:
 
@@ -186,6 +214,8 @@ python radseg_minimal_demo.py \
 ```
 
 `--show-labels` is only available in the default segmentation mode and cannot be combined with `--heatmaps`.
+
+`--sam-refinement` cannot be combined with `--instance-segmentation` in this first version.
 
 The first run will still download the RADIO weights if they are not already cached locally.
 
@@ -201,6 +231,12 @@ When `--timings` is enabled, the demo prints and stores the duration of each sta
 | `create_encoder` | Both | Build `RADSegEncoder`, load RADIO/adaptors, move the model to the selected device | Often large on the first run. In `segmentation`, this also includes text-embedding setup for the requested classes. |
 | `model_inference` | Segmentation | Run the main end-to-end prediction path and produce segmentation logits/predictions | This is the core image inference time for mask mode. |
 | `postprocess_mask` | Segmentation | Convert tensors to NumPy, build color mask and overlay in memory | CPU-side processing after inference. Usually much smaller than model loading. |
+| `create_sam2_helper` | Instance | Build the optional SAM2 predictor and AMG wrapper | One-time SAM2 setup cost for instance mode. |
+| `sam2_set_image` | Instance | Compute SAM2 image embeddings for the current image | Usually paid once per image in instance mode. |
+| `build_instance_prompts` | Instance | Extract RADIO seed components and build SAM2 prompts | CPU-side prompt construction from `seg_probs` and `seg_pred`. |
+| `sam2_prompt_candidates` | Instance | Run SAM2 from RADIO-derived prompts | Main SAM2 proposal cost in the default instance mode. |
+| `sam2_amg_candidates` | Instance | Run SAM2 automatic mask generation in hybrid mode | Only present when `--instance-candidate-mode hybrid` is used. |
+| `postprocess_instances` | Instance | Score, filter, suppress duplicates, and rasterize final instances | CPU-side fusion of SAM2 proposals with RADIO probabilities. |
 | `compute_feature_map` | Heatmaps | Extract spatial visual features from the image | Roughly the vision backbone part of heatmap mode. |
 | `align_features` | Heatmaps | Project visual features into the language-aligned space | Usually small compared with backbone inference. |
 | `encode_labels` | Heatmaps | Encode the class names into text embeddings using RADIO prompt templates | Can be very large when many classes are used. RADSeg uses multiple prompt templates per class, so this cost grows with the number of labels. |
