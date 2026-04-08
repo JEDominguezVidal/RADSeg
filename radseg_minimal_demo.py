@@ -62,8 +62,12 @@ def parse_args():
     parser.add_argument(
         "--compile",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Enable torch.compile for the RADIO model and language adaptor.",
+        default=False,
+        help=(
+            "Enable torch.compile for the RADIO model and language adaptor. "
+            "Usually only worth it for repeated inference in a long-lived process "
+            "after warm-up; leave disabled for one-off CLI runs."
+        ),
     )
     parser.add_argument(
         "--output-dir",

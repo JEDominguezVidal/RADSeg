@@ -199,6 +199,7 @@ Useful options:
 - `--show` to display the saved results with `matplotlib`.
 - `--show-labels` to generate additional labeled segmentation outputs and per-region tables in final segmentation mode.
 - `--label-min-area 500` to suppress labels for tiny connected regions that are likely visual noise.
+- `--compile` to opt into `torch.compile` for the RADIO model and language adaptor. This is disabled by default because one-off CLI runs often get slower due to compilation overhead, especially with dynamic shapes and SAM refinement.
 - `--sam-refinement --sam-ckpt sam_vit_h_4b8939.pth` to enable SAM refinement in final segmentation mode.
 - `--instance-segmentation --sam2-ckpt ...` to enable the new RADIO + SAM2 instance pipeline.
 - `--instance-candidate-mode hybrid` to combine RADIO-guided prompts with SAM2 automatic mask proposals.
@@ -250,6 +251,7 @@ Notes:
 - `segmentation` and `heatmaps` are not directly comparable because they do different work and save different outputs.
 - In `segmentation`, part of the text-processing cost is absorbed into `create_encoder`; in `heatmaps`, it appears explicitly as `encode_labels`.
 - The first run can be slower than later runs if model weights or adaptor files are still being loaded into cache.
+- `--compile` is mainly useful when the same process will run many inferences after warm-up, such as inside a service, notebook session, or custom loop. For the minimal CLI demo, where each invocation usually processes one image and exits, leaving compilation disabled is typically faster end-to-end.
 
 ## 2D Evaluation
 
